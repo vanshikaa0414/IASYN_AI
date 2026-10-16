@@ -54,3 +54,7 @@ dataset_input/dataset/
 *.zip
 *.tar.gz
 
+# Runtime uploads & media storage
+backend/storage/videos/*
+!backend/storage/videos/.gitkeep
+

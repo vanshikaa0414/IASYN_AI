@@ -13,6 +13,12 @@ class UserRegisterRequest(BaseModel):
     password: str
     role: str
 
+class PatientRegisterRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    confirm_password: str
+
 class UserResponse(BaseModel):
     id: int
     name: str

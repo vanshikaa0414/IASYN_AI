@@ -1,5 +1,5 @@
 import { api } from './api';
-import { DoctorDashboardData, AssignedPatient, WebcamAssessment, DoctorFeedback } from '../types/assessment';
+import { DoctorDashboardData, AssignedPatient, WebcamAssessment, DoctorFeedback, PatientProgressData, ModelEvaluationData } from '../types/assessment';
 
 export const doctorService = {
   getDoctorDashboard: async (): Promise<DoctorDashboardData> => {
@@ -23,5 +23,13 @@ export const doctorService = {
     return api.post<DoctorFeedback>(`/doctor/assessments/${assessmentId}/feedback`, {
       feedback_text: feedbackText
     });
+  },
+
+  getPatientProgress: async (patientId: number): Promise<PatientProgressData> => {
+    return api.get<PatientProgressData>(`/doctor/patients/${patientId}/progress`);
+  },
+
+  getModelEvaluation: async (): Promise<ModelEvaluationData> => {
+    return api.get<ModelEvaluationData>('/doctor/model-evaluation');
   }
 };

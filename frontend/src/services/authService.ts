@@ -10,6 +10,19 @@ export const authService = {
     return data;
   },
 
+  registerPatient: async (name: string, email: string, password: string, confirm_password: string): Promise<TokenResponse> => {
+    const data = await api.post<TokenResponse>('/auth/register-patient', {
+      name,
+      email,
+      password,
+      confirm_password
+    });
+    localStorage.setItem('iasyn_token', data.access_token);
+    localStorage.setItem('iasyn_user', JSON.stringify(data.user));
+    window.dispatchEvent(new Event('auth_change'));
+    return data;
+  },
+
   getCurrentUser: (): User | null => {
     const userStr = localStorage.getItem('iasyn_user');
     if (!userStr) return null;

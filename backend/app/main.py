@@ -3,16 +3,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.database import engine, Base
+from app.database import engine, Base, upgrade_database_schema
 import app.models # ensure all models are imported for metadata reflection
-from app.routers import auth_router, patient_router, doctor_router, ml_router
+from app.routers import auth_router, patient_router, doctor_router, ml_router, assessments_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize SQLite database schema
     print("Initializing SQLite tables...")
     Base.metadata.create_all(bind=engine)
-    print("SQLite database initialized successfully.")
+    upgrade_database_schema(engine)
+    print("SQLite database initialized and upgraded successfully.")
     yield
 
 app = FastAPI(
@@ -36,6 +37,7 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(patient_router, prefix="/api")
 app.include_router(doctor_router, prefix="/api")
 app.include_router(ml_router, prefix="/api")
+app.include_router(assessments_router, prefix="/api")
 
 @app.get("/")
 def read_root():

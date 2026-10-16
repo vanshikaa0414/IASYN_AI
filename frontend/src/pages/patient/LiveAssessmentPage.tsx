@@ -10,7 +10,9 @@ import {
 } from '../../features/webcam/observations';
 import { poseLandmarkerService } from '../../features/webcam/poseLandmarkerService';
 import { Live3DPoseVisualization } from '../../features/webcam/Live3DPoseVisualization';
+import { LiveAngleTelemetryGraph } from '../../features/webcam/LiveAngleTelemetryGraph';
 import { assessmentService } from '../../services/assessmentService';
+import { useToast } from '../../context/ToastContext';
 import { NormalizedLandmark, Landmark } from '@mediapipe/tasks-vision';
 import {
   Camera,
@@ -25,10 +27,12 @@ import {
   Check,
   HelpCircle,
   FlipHorizontal,
+  Download,
 } from 'lucide-react';
 
 export const LiveAssessmentPage: React.FC = () => {
   const navigate = useNavigate();
+  const { showToast } = useToast();
 
   // Camera & Stream State
   const [cameraActive, setCameraActive] = useState(false);
@@ -46,6 +50,12 @@ export const LiveAssessmentPage: React.FC = () => {
   // Real-time Kinematics Metrics
   const [currentAngle, setCurrentAngle] = useState(90.0);
   const [repCount, setRepCount] = useState(0);
+  const [incompleteCount, setIncompleteCount] = useState(0);
+  const [totalAttempts, setTotalAttempts] = useState(0);
+  const [passedAttempts, setPassedAttempts] = useState(0);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [unassessableAttempts, setUnassessableAttempts] = useState(0);
+  const [movementPassRate, setMovementPassRate] = useState<number | null>(null);
   const [currentPhase, setCurrentPhase] = useState<ExercisePhase>('WAITING');
   const [extensionProgress, setExtensionProgress] = useState(0);
   const [trackingConfidence, setTrackingConfidence] = useState(0.0);
@@ -75,12 +85,19 @@ export const LiveAssessmentPage: React.FC = () => {
   const animationFrameRef = useRef<number | null>(null);
   const lastVideoTimeRef = useRef<number>(-1);
 
-  // MediaRecorder refs for optional local in-browser video review
+  // Stability & Leg Locking Refs
+  const lockedSideRef = useRef<'right' | 'left' | null>(null);
+  const lastUiUpdateRef = useRef<number>(0);
+  const currentDisplayAngleRef = useRef<number>(90.0);
+
+  // MediaRecorder refs for private local video recording and authenticated upload
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  const recordedBlobRef = useRef<Blob | null>(null);
+  const previewVideoRef = useRef<HTMLVideoElement | null>(null);
 
-  // Algorithmic processing instances
-  const angleCalcRef = useRef(new AngleCalculator(0.35));
+  // Algorithmic processing instances with 1-Euro filter and display deadband
+  const angleCalcRef = useRef(new AngleCalculator(0.35, { minCutoff: 0.8, beta: 0.05 }, 0.8));
   const repCounterRef = useRef(new RepetitionCounter());
   const timerIntervalRef = useRef<any>(null);
 
@@ -226,17 +243,27 @@ export const LiveAssessmentPage: React.FC = () => {
         const lms = frameResult.landmarks;
         const wLms = frameResult.worldLandmarks;
 
-        // Auto-select monitored side based on visibility and position, or use chosen side
-        let side: 'right' | 'left' = 'right';
+        // Stable camera-side leg selection: lock leg once detected or explicitly selected; do not flip-flop per frame
+        let side: 'right' | 'left' = activeLegInUse;
         if (selectedLeg === 'auto') {
-          // Compare visibility of right knee (26) vs left knee (25)
-          const rightVis = lms[26]?.visibility ?? 0;
-          const leftVis = lms[25]?.visibility ?? 0;
-          side = rightVis >= leftVis ? 'right' : 'left';
+          if (!lockedSideRef.current) {
+            const rightVis = lms[26]?.visibility ?? 0;
+            const leftVis = lms[25]?.visibility ?? 0;
+            if (rightVis > 0.35 || leftVis > 0.35) {
+              side = rightVis >= leftVis ? 'right' : 'left';
+              lockedSideRef.current = side;
+              setActiveLegInUse(side);
+            }
+          } else {
+            side = lockedSideRef.current;
+          }
         } else {
           side = selectedLeg;
+          lockedSideRef.current = side;
+          if (activeLegInUse !== side) {
+            setActiveLegInUse(side);
+          }
         }
-        setActiveLegInUse(side);
 
         // Extract landmark indices for selected side
         const hipIdx = side === 'right' ? 24 : 23;
@@ -244,59 +271,113 @@ export const LiveAssessmentPage: React.FC = () => {
         const ankleIdx = side === 'right' ? 28 : 27;
         const shoulderIdx = side === 'right' ? 12 : 11;
 
-        const hip = lms[hipIdx];
-        const knee = lms[kneeIdx];
-        const ankle = lms[ankleIdx];
-        const shoulder = lms[shoulderIdx];
+        const rawHip = lms[hipIdx];
+        const rawKnee = lms[kneeIdx];
+        const rawAnkle = lms[ankleIdx];
+        const rawShoulder = lms[shoulderIdx];
 
         // Calculate confidence
-        const confidence = angleCalcRef.current.calculateConfidence(hip, knee, ankle);
-        setTrackingConfidence(confidence);
-
+        const confidence = angleCalcRef.current.calculateConfidence(rawHip, rawKnee, rawAnkle);
         const reliable = confidence >= 0.40;
-        setIsTrackingReliable(reliable);
+
+        // Clone landmarks array so we can smooth key joints for rock-solid 2D skeleton rendering
+        const smoothedLms = [...lms];
 
         if (reliable) {
-          // Calculate knee angle with vector geometry + EMA smoothing
-          const angle = angleCalcRef.current.calculateKneeAngle(hip, knee, ankle);
-          const trunkAngle = angleCalcRef.current.calculateTrunkAngle(shoulder, hip);
+          // Smooth 2D landmarks with speed-adaptive 1-Euro filters to eliminate stationary jitter
+          const smoothedTriplet = angleCalcRef.current.smoothLandmarkTriplet(rawHip, rawKnee, rawAnkle, now);
+          const smoothedShoulder = angleCalcRef.current.smoothShoulder(rawShoulder, now);
 
-          setCurrentAngle(angle);
+          smoothedLms[hipIdx] = { ...rawHip, x: smoothedTriplet.hip.x, y: smoothedTriplet.hip.y };
+          smoothedLms[kneeIdx] = { ...rawKnee, x: smoothedTriplet.knee.x, y: smoothedTriplet.knee.y };
+          smoothedLms[ankleIdx] = { ...rawAnkle, x: smoothedTriplet.ankle.x, y: smoothedTriplet.ankle.y };
+          smoothedLms[shoulderIdx] = { ...rawShoulder, x: smoothedShoulder.x, y: smoothedShoulder.y };
+
+          // Calculate knee angle with vector geometry and 1-Euro temporal smoothing
+          const filteredAngle = angleCalcRef.current.calculateKneeAngle(
+            smoothedTriplet.hip,
+            smoothedTriplet.knee,
+            smoothedTriplet.ankle,
+            now
+          );
+
+          // Apply display deadband (e.g. 0.8°) to prevent decimal place fluctuation when stationary
+          const displayAngle = angleCalcRef.current.getDisplayAngle(filteredAngle);
+          const trunkAngle = angleCalcRef.current.calculateTrunkAngle(smoothedShoulder, smoothedTriplet.hip);
 
           // Update repetition state machine
-          const repResult = repCounterRef.current.processFrame(angle, trunkAngle, confidence, now);
-          setRepCount(repResult.repCount);
-          setCurrentPhase(repResult.phase);
-          setExtensionProgress(repResult.extensionProgress);
+          const repResult = repCounterRef.current.processFrame(filteredAngle, trunkAngle, confidence, now);
 
-          // Evaluate real-time posture
-          const postureEval = evaluateLivePosture(angle, trunkAngle, confidence);
-          setLivePosture(postureEval);
+          // Throttle UI React state updates (~20 Hz or on rep/incomplete event) to avoid excessive re-renders
+          const shouldUpdateUi =
+            now - lastUiUpdateRef.current >= 50 ||
+            repResult.newRepCompleted ||
+            repResult.newIncompleteRecorded;
 
-          // Send 3D world landmarks to Three.js stick figure
-          if (wLms && wLms.length >= 29) {
-            setWorldLandmarks(wLms);
+          if (shouldUpdateUi) {
+            lastUiUpdateRef.current = now;
+            setTrackingConfidence(confidence);
+            setIsTrackingReliable(true);
+
+            if (Math.abs(displayAngle - currentDisplayAngleRef.current) >= 0.1) {
+              currentDisplayAngleRef.current = displayAngle;
+              setCurrentAngle(displayAngle);
+            }
+
+            setRepCount(repResult.repCount);
+            setTotalAttempts(repResult.totalAttempts);
+            setPassedAttempts(repResult.passedAttempts);
+            setFailedAttempts(repResult.failedAttempts);
+            setUnassessableAttempts(repResult.unassessableAttempts);
+            setMovementPassRate(repResult.movementPassRate);
+            setIncompleteCount(repResult.failedAttempts + repResult.unassessableAttempts);
+            setCurrentPhase(repResult.phase);
+            setExtensionProgress(repResult.extensionProgress);
+
+            const postureEval = evaluateLivePosture(filteredAngle, trunkAngle, confidence);
+            setLivePosture(postureEval);
+
+            if (wLms && wLms.length >= 29) {
+              setWorldLandmarks(wLms);
+            }
           }
         } else {
-          setLivePosture((prev) => ({
-            ...prev,
-            trackingReliable: false,
-            liveFeedback: 'Unable to assess — please reposition camera to show hip, knee & ankle clearly.',
-          }));
+          // Tracking quality insufficient
+          const shouldUpdateUi = now - lastUiUpdateRef.current >= 200;
+          if (shouldUpdateUi) {
+            lastUiUpdateRef.current = now;
+            setIsTrackingReliable(false);
+            setTrackingConfidence(confidence);
+            setLivePosture({
+              trunkStable: true,
+              trunkAngle: 0,
+              extensionReached: false,
+              returnReached: true,
+              trackingReliable: false,
+              liveFeedback: 'Tracking temporarily unavailable — reposition camera in side profile view.',
+            });
+          }
         }
 
-        // Draw 2D Skeleton Overlay onto Canvas
-        drawPoseSkeleton(ctx, lms, canvas.width, canvas.height, side, reliable);
+        // Draw 2D Skeleton Overlay onto Canvas using smoothed landmarks
+        drawPoseSkeleton(ctx, smoothedLms, canvas.width, canvas.height, side, reliable);
       } else {
         // No body detected
-        setIsTrackingReliable(false);
-        setTrackingConfidence(0.0);
-        setWorldLandmarks(null);
-        setLivePosture((prev) => ({
-          ...prev,
-          trackingReliable: false,
-          liveFeedback: 'No person detected in frame. Step into camera view.',
-        }));
+        const shouldUpdateUi = now - lastUiUpdateRef.current >= 250;
+        if (shouldUpdateUi) {
+          lastUiUpdateRef.current = now;
+          setIsTrackingReliable(false);
+          setTrackingConfidence(0.0);
+          setWorldLandmarks(null);
+          setLivePosture({
+            trunkStable: true,
+            trunkAngle: 0,
+            extensionReached: false,
+            returnReached: true,
+            trackingReliable: false,
+            liveFeedback: 'No person detected in frame. Step into camera view.',
+          });
+        }
       }
 
       animationFrameRef.current = requestAnimationFrame(renderFrame);
@@ -434,6 +515,18 @@ export const LiveAssessmentPage: React.FC = () => {
     ctx.restore();
   };
 
+  // Monitored leg selection handler with filter reset
+  const handleSelectLeg = (sideOption: 'auto' | 'right' | 'left') => {
+    setSelectedLeg(sideOption);
+    if (sideOption !== 'auto') {
+      lockedSideRef.current = sideOption;
+      setActiveLegInUse(sideOption);
+    } else {
+      lockedSideRef.current = null;
+    }
+    angleCalcRef.current.reset();
+  };
+
   // Start Recording Session Button Handler
   const startRecording = () => {
     if (!cameraActive) {
@@ -441,28 +534,39 @@ export const LiveAssessmentPage: React.FC = () => {
       return;
     }
 
-    // Reset metrics
+    // Reset metrics and filters
     angleCalcRef.current.reset();
     repCounterRef.current.reset();
+    if (selectedLeg === 'auto') {
+      lockedSideRef.current = null;
+    }
     setRepCount(0);
+    setIncompleteCount(0);
+    setTotalAttempts(0);
+    setPassedAttempts(0);
+    setFailedAttempts(0);
+    setUnassessableAttempts(0);
+    setMovementPassRate(null);
     setSessionTime(0);
     setIsRecording(true);
     setShowSummaryModal(false);
     setSavedSuccess(false);
+    recordedBlobRef.current = null;
     if (recordedVideoUrl) URL.revokeObjectURL(recordedVideoUrl);
     setRecordedVideoUrl(null);
 
-    // Initialize MediaRecorder for local in-memory preview
+    // Initialize MediaRecorder using browser-supported video MIME type
     try {
       if (streamRef.current && typeof MediaRecorder !== 'undefined') {
         recordedChunksRef.current = [];
-        const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-          ? 'video/webm;codecs=vp9'
-          : MediaRecorder.isTypeSupported('video/webm')
-          ? 'video/webm'
-          : 'video/mp4';
+        const supportedMime = [
+          'video/webm;codecs=vp9',
+          'video/webm;codecs=vp8',
+          'video/webm',
+          'video/mp4'
+        ].find((type) => MediaRecorder.isTypeSupported(type)) || 'video/webm';
 
-        const recorder = new MediaRecorder(streamRef.current, { mimeType });
+        const recorder = new MediaRecorder(streamRef.current, { mimeType: supportedMime });
         recorder.ondataavailable = (event) => {
           if (event.data && event.data.size > 0) {
             recordedChunksRef.current.push(event.data);
@@ -470,7 +574,8 @@ export const LiveAssessmentPage: React.FC = () => {
         };
         recorder.onstop = () => {
           if (recordedChunksRef.current.length > 0) {
-            const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+            const blob = new Blob(recordedChunksRef.current, { type: supportedMime });
+            recordedBlobRef.current = blob;
             const url = URL.createObjectURL(blob);
             setRecordedVideoUrl(url);
           }
@@ -507,26 +612,36 @@ export const LiveAssessmentPage: React.FC = () => {
       }
     }
 
-    // Generate comprehensive clinical summary report
+    // Generate comprehensive clinical summary report with attempt-level classification
     const completedReps = repCounterRef.current.getCompletedReps();
+    const incompleteAttempts = repCounterRef.current.getIncompleteAttempts();
+    const attempts = repCounterRef.current.getAttempts();
     const extrema = repCounterRef.current.getSessionExtrema();
     const summary = analyzeSessionObservations(
       completedReps,
       trackingConfidence,
       sessionTime,
-      extrema
+      extrema,
+      incompleteAttempts,
+      attempts,
+      {
+        min_extension_angle: repCounterRef.current.config.extensionThreshold,
+        max_starting_angle: repCounterRef.current.config.restThreshold,
+        min_hold_seconds: repCounterRef.current.config.minHoldDurationSeconds,
+        max_trunk_compensation_deg: repCounterRef.current.config.maxTrunkLeanDeg
+      }
     );
 
     setSummaryReport(summary);
     setShowSummaryModal(true);
   };
 
-  // Save Assessment to SQLite Backend
-  const handleSaveAssessment = async () => {
+  // Save Assessment to SQLite Backend with explicit consent choice
+  const handleSaveAssessment = async (saveVideo: boolean) => {
     if (!summaryReport) return;
     setIsSaving(true);
     try {
-      await assessmentService.createAssessment({
+      const created = await assessmentService.createAssessment({
         exercise_name: 'Seated Knee Extension',
         duration_seconds: sessionTime,
         repetition_count: summaryReport.repetitionCount,
@@ -536,8 +651,22 @@ export const LiveAssessmentPage: React.FC = () => {
         tracking_quality: summaryReport.trackingQuality,
         observations: summaryReport.observations,
         assessment_status: summaryReport.assessmentStatus,
+        total_attempts: summaryReport.totalAttempts,
+        passed_attempts: summaryReport.passedAttempts,
+        failed_attempts: summaryReport.failedAttempts,
+        unassessable_attempts: summaryReport.unassessableAttempts,
+        movement_pass_rate: summaryReport.movementPassRate,
+        attempts: summaryReport.attempts,
+        configured_criteria: summaryReport.configuredCriteria,
       });
+
+      // If user consents to video saving, upload recorded blob to private storage
+      if (saveVideo && recordedBlobRef.current) {
+        await assessmentService.uploadAssessmentVideo(created.id, recordedBlobRef.current);
+      }
+
       setSavedSuccess(true);
+      showToast('Report Saved Successfully!', 'Your kinematics and session data were securely recorded.', 'success');
     } catch (err: any) {
       alert(`Failed to save report: ${err?.message || 'Server connection error'}`);
     } finally {
@@ -545,21 +674,52 @@ export const LiveAssessmentPage: React.FC = () => {
     }
   };
 
+  // Download recorded video directly to user's computer / Downloads folder
+  const handleDownloadVideo = () => {
+    if (!recordedBlobRef.current && !recordedVideoUrl) return;
+
+    let extension = 'webm';
+    if (recordedBlobRef.current?.type) {
+      if (recordedBlobRef.current.type.includes('mp4')) {
+        extension = 'mp4';
+      } else if (recordedBlobRef.current.type.includes('webm')) {
+        extension = 'webm';
+      }
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `IASYN_Knee_Extension_Assessment_${timestamp}.${extension}`;
+
+    const url = recordedVideoUrl || (recordedBlobRef.current ? URL.createObjectURL(recordedBlobRef.current) : null);
+    if (!url) return;
+
+    const downloadLink = document.createElement('a');
+    downloadLink.href = url;
+    downloadLink.download = filename;
+    document.body.appendChild(downloadLink);
+    downloadLink.click();
+    document.body.removeChild(downloadLink);
+    showToast('Download Started', `Saving ${filename} to your Downloads folder.`, 'success');
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
       {/* Top Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-5">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-white/10 pb-5">
         <div>
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-[11px] font-bold uppercase tracking-wider text-teal-700 bg-teal-50 border border-teal-200 px-2.5 py-0.5 rounded-full">
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="badge-violet">
               Google MediaPipe Tasks Vision Pose Landmarker
             </span>
-            <span className="text-slate-400 text-xs">•</span>
-            <span className="text-xs font-semibold text-slate-600">Seated Knee Extension</span>
+            <span className="text-white/20 text-xs">•</span>
+            <span className="text-xs font-semibold text-[#B7B8C8]">Seated Knee Extension</span>
           </div>
-          <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight">
-            Live Webcam Assessment
+          <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
+            Live Knee Assessment
           </h1>
+          <p className="text-xs text-[#85879C] mt-0.5">
+            Real-time seated knee-extension analysis & 3D biomechanical tracking
+          </p>
         </div>
 
         {/* Top Camera Controls */}
@@ -568,9 +728,9 @@ export const LiveAssessmentPage: React.FC = () => {
             <button
               type="button"
               onClick={stopCamera}
-              className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs transition-colors flex items-center gap-2 shadow-xs"
+              className="px-4 py-2.5 rounded-full bg-[#171925] hover:bg-[#1f2233] border border-white/10 text-white font-semibold text-xs transition-colors flex items-center gap-2 shadow-xs"
             >
-              <CameraOff className="w-4 h-4 text-rose-400" />
+              <CameraOff className="w-4 h-4 text-[#FB7185]" />
               <span>Stop Camera</span>
             </button>
           ) : (
@@ -578,7 +738,7 @@ export const LiveAssessmentPage: React.FC = () => {
               type="button"
               onClick={startCamera}
               disabled={isCameraLoading}
-              className="px-5 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs shadow-md shadow-teal-600/20 transition-all flex items-center gap-2 disabled:opacity-50"
+              className="btn-pill-primary text-xs !py-2.5 !px-5 flex items-center gap-2 disabled:opacity-50"
             >
               <Camera className="w-4 h-4" />
               <span>{isCameraLoading ? 'Initializing MediaPipe...' : 'Start Camera'}</span>
@@ -587,346 +747,318 @@ export const LiveAssessmentPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Main 2-Column Grid: LEFT = Video Feed & Overlay | RIGHT = 3D Skeleton & Real-time Metrics */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* LEFT COLUMN: Live Camera Feed & Skeleton Canvas (7 cols) */}
-        <div className="lg:col-span-7 space-y-4">
-          <div className="relative aspect-video w-full bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 shadow-xl flex items-center justify-center">
-            {/* Real HTML Video Element */}
-            <video
-              ref={videoRef}
-              playsInline
-              muted
-              className={`w-full h-full object-contain ${isMirrored ? 'scale-x-[-1]' : ''} ${
-                !cameraActive ? 'hidden' : 'block'
-              }`}
-            />
+      {/* SECTION 7 & 11: MAIN 2-COLUMN EQUAL-SIZED WORKSPACE */}
+      {/* Left = Live Camera (4:3) | Right = 3D Pose Visualization (4:3) */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-stretch">
+        {/* LEFT PANEL: Live Camera Feed & Skeleton Canvas */}
+        <div className="relative aspect-[4/3] w-full bg-[#0B0D16] rounded-2xl overflow-hidden border border-white/10 shadow-2xl flex items-center justify-center">
+          {/* Real HTML Video Element */}
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            className={`w-full h-full object-contain ${isMirrored ? 'scale-x-[-1]' : ''} ${
+              !cameraActive ? 'hidden' : 'block'
+            }`}
+          />
 
-            {/* Skeleton Overlay Canvas */}
-            <canvas
-              ref={canvasRef}
-              className={`absolute inset-0 w-full h-full pointer-events-none ${
-                !cameraActive ? 'hidden' : 'block'
-              }`}
-            />
+          {/* Skeleton Overlay Canvas */}
+          <canvas
+            ref={canvasRef}
+            className={`absolute inset-0 w-full h-full pointer-events-none ${
+              !cameraActive ? 'hidden' : 'block'
+            }`}
+          />
 
-            {/* Camera Offline Placeholder */}
-            {!cameraActive && (
-              <div className="flex flex-col items-center justify-center p-6 text-center max-w-md">
-                <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-teal-400 mb-4 shadow-inner">
-                  <Camera className="w-7 h-7" />
-                </div>
-                <h3 className="text-base font-bold text-slate-100 mb-1">Webcam Offline</h3>
-                <p className="text-xs text-slate-400 leading-relaxed mb-4">
-                  Position your camera 5 to 7 feet away showing your side profile (hip, knee, and ankle clearly visible).
-                </p>
-
-                {cameraError ? (
-                  <div className="p-3 mb-4 rounded-xl bg-rose-950/60 border border-rose-800 text-rose-200 text-xs text-left flex items-start gap-2">
-                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                    <span>{cameraError}</span>
-                  </div>
-                ) : null}
-
-                <button
-                  type="button"
-                  onClick={startCamera}
-                  disabled={isCameraLoading}
-                  className="px-6 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-500 text-white font-bold text-xs shadow-md transition-all flex items-center gap-2"
-                >
-                  <Camera className="w-4 h-4" />
-                  <span>{isCameraLoading ? 'Starting Device Camera...' : 'Turn On Camera'}</span>
-                </button>
+          {/* Camera Offline Placeholder */}
+          {!cameraActive && (
+            <div className="flex flex-col items-center justify-center p-6 text-center max-w-md z-10">
+              <div className="w-14 h-14 rounded-2xl bg-[#11131D] border border-white/10 flex items-center justify-center text-[#A78BFA] mb-4 shadow-inner">
+                <Camera className="w-7 h-7" />
               </div>
-            )}
+              <h3 className="text-base font-bold text-white mb-1">Webcam Offline</h3>
+              <p className="text-xs text-[#85879C] leading-relaxed mb-4">
+                Position your camera 5 to 7 feet away showing your side profile (hip, knee, and ankle clearly visible).
+              </p>
 
-            {/* Live Camera Overlays (when active) */}
-            {cameraActive && (
-              <>
-                {/* Top-Left Live Status Badge */}
-                <div className="absolute top-3 left-3 z-10 flex items-center gap-2">
-                  <div className="bg-slate-900/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-700 text-xs text-white flex items-center gap-2 shadow-md">
-                    <span
-                      className={`w-2 h-2 rounded-full ${
-                        isTrackingReliable ? 'bg-teal-400 animate-pulse' : 'bg-amber-400'
-                      }`}
-                    />
-                    <span className="font-semibold">
-                      {isTrackingReliable ? 'MediaPipe Tracking' : 'Searching for Joints'}
-                    </span>
-                    <span className="text-slate-400 font-mono text-[11px]">
-                      ({Math.round(trackingConfidence * 100)}%)
-                    </span>
-                  </div>
-
-                  {isRecording && (
-                    <div className="bg-rose-950/85 border border-rose-700/80 backdrop-blur-md px-3 py-1.5 rounded-xl text-xs text-rose-200 flex items-center gap-1.5 shadow-md">
-                      <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping" />
-                      <span className="font-bold">REC</span>
-                      <span className="font-mono font-bold text-white">{formatTimer(sessionTime)}</span>
-                    </div>
-                  )}
+              {cameraError ? (
+                <div className="p-3 mb-4 rounded-xl bg-[#FB7185]/10 border border-[#FB7185]/30 text-[#FB7185] text-xs text-left flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{cameraError}</span>
                 </div>
+              ) : null}
 
-                {/* Bottom-Center Feedback Banner */}
-                <div className="absolute bottom-3 left-3 right-3 z-10">
-                  <div
-                    className={`px-4 py-2 rounded-xl backdrop-blur-md border text-xs flex items-center justify-between shadow-lg ${
-                      isTrackingReliable
-                        ? livePosture.trunkStable
-                          ? 'bg-slate-900/85 border-teal-500/50 text-slate-100'
-                          : 'bg-amber-950/90 border-amber-600/60 text-amber-100'
-                        : 'bg-rose-950/90 border-rose-700/70 text-rose-100'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <Info className="w-4 h-4 text-teal-400 shrink-0" />
-                      <span className="font-medium">{livePosture.liveFeedback}</span>
-                    </div>
-
-                    <span className="font-mono text-[11px] text-teal-300 font-bold shrink-0 ml-2">
-                      Side: {activeLegInUse.toUpperCase()}
-                    </span>
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
-
-          {/* Camera Toolbar */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-3.5 shadow-xs flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-slate-700">Monitored Leg:</span>
-              <div className="flex rounded-xl bg-slate-100 p-0.5 border border-slate-200">
-                {(['auto', 'right', 'left'] as const).map((sideOption) => (
-                  <button
-                    key={sideOption}
-                    type="button"
-                    onClick={() => setSelectedLeg(sideOption)}
-                    className={`px-3 py-1 rounded-lg font-semibold text-xs transition-colors capitalize ${
-                      selectedLeg === sideOption
-                        ? 'bg-white text-teal-700 shadow-xs'
-                        : 'text-slate-500 hover:text-slate-800'
-                    }`}
-                  >
-                    {sideOption}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="flex items-center gap-3">
               <button
                 type="button"
-                onClick={() => setIsMirrored((prev) => !prev)}
-                className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors ${
-                  isMirrored
-                    ? 'bg-teal-50 border-teal-200 text-teal-800'
-                    : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
-                }`}
-                title="Toggle horizontal mirror orientation"
+                onClick={startCamera}
+                disabled={isCameraLoading}
+                className="btn-pill-primary text-xs !py-2.5 !px-6 flex items-center gap-2"
               >
-                <FlipHorizontal className="w-3.5 h-3.5" />
-                <span>{isMirrored ? 'Mirrored (Selfie)' : 'Standard'}</span>
+                <Camera className="w-4 h-4" />
+                <span>{isCameraLoading ? 'Starting Device Camera...' : 'Turn On Camera'}</span>
               </button>
             </div>
-          </div>
+          )}
 
-          {/* Setup Instructions Card */}
-          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-600 flex items-start gap-3">
-            <HelpCircle className="w-4 h-4 text-teal-600 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <span className="font-bold text-slate-800 block">Biomechanical Setup Guide:</span>
-              <p>
-                1. Sit sideways to your webcam on a stable chair so your hip, knee, and ankle joints are visible.
-              </p>
-              <p>
-                2. Wear contrasting or fitted clothing so joint contours can be detected accurately without occlusion.
-              </p>
-              <p>
-                3. Keep your back supported against the chair to isolate quadriceps contraction without compensatory trunk leaning.
-              </p>
+          {/* Live Camera Overlays (when active) */}
+          {cameraActive && (
+            <>
+              {/* Top-Left Live Status Badge */}
+              <div className="absolute top-3 left-3 z-10 flex items-center gap-2">
+                <div className="bg-[#11131D]/90 backdrop-blur-md px-3 py-1.5 rounded-xl border border-white/10 text-xs text-white flex items-center gap-2 shadow-md">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      isTrackingReliable ? 'bg-[#7DE8F0] animate-pulse' : 'bg-[#FBBF24]'
+                    }`}
+                  />
+                  <span className="font-semibold text-[11px]">
+                    {isTrackingReliable ? 'MediaPipe Tracking' : 'Searching for Joints'}
+                  </span>
+                  <span className="text-[#85879C] font-mono text-[11px]">
+                    ({Math.round(trackingConfidence * 100)}%)
+                  </span>
+                </div>
+
+                {isRecording && (
+                  <div className="bg-[#FB7185]/20 border border-[#FB7185]/40 backdrop-blur-md px-3 py-1.5 rounded-xl text-xs text-[#FB7185] flex items-center gap-1.5 shadow-md">
+                    <span className="w-2 h-2 rounded-full bg-[#FB7185] animate-ping" />
+                    <span className="font-bold">REC</span>
+                    <span className="font-mono font-bold text-white">{formatTimer(sessionTime)}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Bottom-Center Feedback Banner */}
+              <div className="absolute bottom-3 left-3 right-3 z-10">
+                <div
+                  className={`px-4 py-2 rounded-xl backdrop-blur-md border text-xs flex items-center justify-between shadow-lg ${
+                    isTrackingReliable
+                      ? livePosture.trunkStable
+                        ? 'bg-[#11131D]/90 border-[#A78BFA]/30 text-white'
+                        : 'bg-[#FBBF24]/15 border-[#FBBF24]/40 text-[#FBBF24]'
+                      : 'bg-[#FB7185]/15 border-[#FB7185]/40 text-[#FB7185]'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <Info className="w-4 h-4 text-[#A78BFA] shrink-0" />
+                    <span className="font-medium text-[11px] sm:text-xs">{livePosture.liveFeedback}</span>
+                  </div>
+
+                  <span className="font-mono text-[11px] text-[#7DE8F0] font-bold shrink-0 ml-2">
+                    SIDE: {activeLegInUse.toUpperCase()}
+                  </span>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* RIGHT PANEL: 3D Pose Visualization (Equal 4:3 aspect ratio) */}
+        <div className="relative aspect-[4/3] w-full glass-panel rounded-2xl overflow-hidden border border-white/10 shadow-2xl flex items-center justify-center">
+          <Live3DPoseVisualization
+            worldLandmarks={worldLandmarks}
+            monitoredSide={activeLegInUse}
+            isTracking={isTrackingReliable}
+          />
+        </div>
+      </div>
+
+      {/* SECOND ROW: COMPACT METRIC CARDS (6-column responsive grid with frosted glass) */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5">
+        {/* Card 1: Live Joint Angle */}
+        <div className="glass-card glass-card-hover p-4 flex flex-col justify-between">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#85879C]">Knee Angle</span>
+            <span
+              className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
+                currentPhase === 'KNEE EXTENDED'
+                  ? 'bg-[#34D399]/20 text-[#34D399] border border-[#34D399]/30'
+                  : currentPhase === 'EXTENDING'
+                  ? 'bg-[#A78BFA]/20 text-[#A78BFA] border border-[#A78BFA]/30'
+                  : currentPhase === 'RETURNING'
+                  ? 'bg-[#7DE8F0]/20 text-[#7DE8F0] border border-[#7DE8F0]/30'
+                  : 'bg-white/5 text-[#85879C]'
+              }`}
+            >
+              {currentPhase === 'KNEE EXTENDED' ? 'EXTENDED' : currentPhase}
+            </span>
+          </div>
+          <div className="my-1">
+            <span className="text-3xl font-black text-white tracking-tight">{currentAngle.toFixed(1)}°</span>
+          </div>
+          <div className="space-y-1">
+            <div className="flex justify-between text-[10px] text-[#85879C]">
+              <span>ROM: <strong className="text-[#A78BFA]">{extensionProgress}%</strong></span>
+              <span>≥168°</span>
+            </div>
+            <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+              <div
+                className="h-full rounded-full transition-all duration-150 bg-gradient-to-r from-[#7C6CF5] to-[#A78BFA]"
+                style={{ width: `${extensionProgress}%` }}
+              />
             </div>
           </div>
         </div>
 
-        {/* RIGHT COLUMN: Live 3D Pose Visualization & Real-time Metrics (5 cols) */}
-        <div className="lg:col-span-5 space-y-4">
-          {/* Live 3D Pose Visualization Panel */}
-          <div className="h-[270px]">
-            <Live3DPoseVisualization
-              worldLandmarks={worldLandmarks}
-              monitoredSide={activeLegInUse}
-              isTracking={isTrackingReliable}
+        {/* Card 2: Valid Repetitions */}
+        <div className="glass-card glass-card-hover p-4 flex flex-col justify-between">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[#85879C]">Valid Reps</span>
+          <div className="my-1">
+            <span className="text-3xl font-black text-[#A78BFA] tracking-tight">{repCount}</span>
+          </div>
+          <div className="text-[10px] text-[#85879C]">
+            Target: 8–12 reps
+          </div>
+        </div>
+
+        {/* Card 3: Passed Attempts */}
+        <div className="glass-card glass-card-hover p-4 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#85879C]">Passed</span>
+            <span className="text-[9px] font-bold text-[#34D399] bg-[#34D399]/15 border border-[#34D399]/30 px-1.5 py-0.5 rounded">PASS</span>
+          </div>
+          <div className="my-1">
+            <span className="text-3xl font-black text-[#34D399] tracking-tight">{passedAttempts}</span>
+          </div>
+          <div className="text-[10px] text-[#85879C]">
+            Rate: {movementPassRate !== null ? `${movementPassRate}%` : 'N/A'}
+          </div>
+        </div>
+
+        {/* Card 4: Failed Attempts */}
+        <div className="glass-card glass-card-hover p-4 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#85879C]">Failed</span>
+            <span className="text-[9px] font-bold text-[#FB7185] bg-[#FB7185]/15 border border-[#FB7185]/30 px-1.5 py-0.5 rounded">FAIL</span>
+          </div>
+          <div className="my-1">
+            <span className="text-3xl font-black text-[#FB7185] tracking-tight">{failedAttempts}</span>
+          </div>
+          <div className="text-[10px] text-[#85879C]">
+            Unassessable: {unassessableAttempts}
+          </div>
+        </div>
+
+        {/* Card 5: Tracking Quality */}
+        <div className="glass-card glass-card-hover p-4 flex flex-col justify-between">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[#85879C]">Tracking</span>
+          <div className="my-1">
+            <span className="text-3xl font-black text-[#7DE8F0] tracking-tight">
+              {Math.round(trackingConfidence * 100)}%
+            </span>
+          </div>
+          <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all duration-200 ${
+                trackingConfidence >= 0.7
+                  ? 'bg-[#34D399]'
+                  : trackingConfidence >= 0.4
+                  ? 'bg-[#FBBF24]'
+                  : 'bg-[#FB7185]'
+              }`}
+              style={{ width: `${Math.round(trackingConfidence * 100)}%` }}
             />
           </div>
+        </div>
 
-          {/* Real-time Knee Angle & Extension Progress Card */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Live Joint Angle
-              </span>
-              <span
-                className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                  currentPhase === 'KNEE EXTENDED'
-                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                    : currentPhase === 'EXTENDING'
-                    ? 'bg-teal-100 text-teal-800 border border-teal-200'
-                    : currentPhase === 'RETURNING'
-                    ? 'bg-cyan-100 text-cyan-800 border border-cyan-200'
-                    : 'bg-slate-100 text-slate-700 border border-slate-200'
-                }`}
-              >
-                {currentPhase}
-              </span>
-            </div>
-
-            <div className="flex items-baseline gap-2">
-              <span className="text-5xl font-black text-slate-900 tracking-tight">
-                {currentAngle.toFixed(1)}°
-              </span>
-              <span className="text-xs font-medium text-slate-400">Interior Knee Flexion</span>
-            </div>
-
-            {/* Extension Progress Gauge */}
-            <div className="space-y-1.5 pt-1">
-              <div className="flex justify-between text-[11px] font-medium text-slate-500">
-                <span>Extension Progress: <strong className="text-teal-700">{extensionProgress}%</strong></span>
-                <span className="text-teal-700 font-bold">Target: ≥168°</span>
-              </div>
-              <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden p-0.5 border border-slate-200">
-                <div
-                  className="h-full rounded-full transition-all duration-150 bg-gradient-to-r from-teal-500 to-cyan-500"
-                  style={{ width: `${extensionProgress}%` }}
-                />
-              </div>
-            </div>
+        {/* Card 6: Session Duration */}
+        <div className="glass-card glass-card-hover p-4 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#85879C]">Duration</span>
+            {isRecording && (
+              <span className="w-2 h-2 rounded-full bg-[#FB7185] animate-ping" />
+            )}
           </div>
-
-          {/* Repetition Counter Card */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Repetitions Completed
-              </span>
-              <Activity className="w-4 h-4 text-teal-600" />
-            </div>
-
-            <div className="flex items-baseline gap-2 mb-1">
-              <span className="text-5xl font-black text-teal-700 tracking-tight">{repCount}</span>
-              <span className="text-xs font-medium text-slate-400">Valid Extensions</span>
-            </div>
-            <p className="text-[11px] text-slate-500">
-              State-machine hysteresis requires full cycle (&gt;150° extension, &lt;115° return).
-            </p>
+          <div className="my-1">
+            <span className="text-3xl font-black text-white font-mono tracking-tight">
+              {formatTimer(sessionTime)}
+            </span>
           </div>
-
-          {/* Live Posture Observations & Tracking Quality Card */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-3.5">
-            <div>
-              <div className="flex justify-between items-center text-xs mb-1">
-                <span className="font-semibold text-slate-700">Tracking Confidence</span>
-                <span className="font-bold text-teal-700">{Math.round(trackingConfidence * 100)}%</span>
-              </div>
-              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div
-                  className={`h-full rounded-full transition-all duration-200 ${
-                    trackingConfidence >= 0.7
-                      ? 'bg-teal-500'
-                      : trackingConfidence >= 0.4
-                      ? 'bg-amber-500'
-                      : 'bg-rose-500'
-                  }`}
-                  style={{ width: `${Math.round(trackingConfidence * 100)}%` }}
-                />
-              </div>
-            </div>
-
-            <div className="pt-2 border-t border-slate-100">
-              <span className="text-xs font-bold text-slate-800 block mb-2">
-                Active Assessment Criteria
-              </span>
-              <ul className="space-y-1.5 text-xs text-slate-600">
-                <li className="flex items-center gap-2">
-                  <CheckCircle2
-                    className={`w-3.5 h-3.5 shrink-0 ${
-                      currentAngle >= 165 ? 'text-teal-600' : 'text-slate-300'
-                    }`}
-                  />
-                  <span>Terminal Extension Target: ≥168°</span>
-                </li>
-                <li className="flex items-center gap-2">
-                  <CheckCircle2
-                    className={`w-3.5 h-3.5 shrink-0 ${
-                      currentAngle <= 115 ? 'text-teal-600' : 'text-slate-300'
-                    }`}
-                  />
-                  <span>Seated Return Threshold: ≤115°</span>
-                </li>
-                <li className="flex items-center gap-2">
-                  <CheckCircle2
-                    className={`w-3.5 h-3.5 shrink-0 ${
-                      livePosture.trunkStable ? 'text-teal-600' : 'text-amber-500'
-                    }`}
-                  />
-                  <span>
-                    Trunk Stability (Limit &lt;18° tilt):{' '}
-                    <strong className={livePosture.trunkStable ? 'text-slate-800' : 'text-amber-700'}>
-                      ~{Math.round(livePosture.trunkAngle)}°
-                    </strong>
-                  </span>
-                </li>
-              </ul>
-            </div>
+          <div className="text-[10px] text-[#85879C]">
+            {isRecording ? 'Session Active' : 'Standby'}
           </div>
         </div>
       </div>
 
-      {/* BELOW: Recording Action Bar */}
-      <div className="bg-slate-900 rounded-2xl p-4 sm:p-5 text-white flex flex-col sm:flex-row items-center justify-between gap-4 shadow-lg border border-slate-800">
+      {/* REAL-TIME KNEE ANGLE TELEMETRY GRAPH */}
+      <LiveAngleTelemetryGraph
+        currentAngle={currentAngle}
+        isTracking={isTrackingReliable}
+        activePhase={currentPhase}
+        rom={repCounterRef.current ? repCounterRef.current.getSessionExtrema().rom : 0}
+        maxAngle={repCounterRef.current ? repCounterRef.current.getSessionExtrema().max : 0}
+        minAngle={repCounterRef.current ? repCounterRef.current.getSessionExtrema().min : 0}
+        targetExtension={repCounterRef.current?.config?.extensionThreshold || 168}
+        flexionThreshold={repCounterRef.current?.config?.restThreshold || 115}
+      />
+
+      {/* THIRD ROW: RECORDING ACTION BAR */}
+      <div className="glass-elevated rounded-2xl p-4 sm:p-5 border border-white/10 shadow-xl flex flex-col sm:flex-row items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           <div
-            className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-              isRecording ? 'bg-rose-600 text-white animate-pulse' : 'bg-slate-800 text-teal-400'
+            className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${
+              isRecording ? 'bg-[#FB7185] text-white animate-pulse' : 'bg-[#171925] border border-white/10 text-[#A78BFA]'
             }`}
           >
             {isRecording ? <Square className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 ml-0.5" />}
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <span className="font-bold text-sm">
+              <span className="font-bold text-sm text-white">
                 {isRecording ? 'Assessment Session In Progress' : 'Ready to Record Assessment'}
               </span>
               {isRecording && (
-                <span className="px-2 py-0.5 rounded-full bg-rose-950 border border-rose-800 text-rose-300 text-[10px] font-bold">
+                <span className="px-2 py-0.5 rounded-full bg-[#FB7185]/20 border border-[#FB7185]/40 text-[#FB7185] text-[10px] font-bold">
                   LIVE
                 </span>
               )}
             </div>
-            <p className="text-xs text-slate-400">
+            <p className="text-xs text-[#85879C]">
               {isRecording
-                ? `Recording time: ${formatTimer(sessionTime)} • ${repCount} reps logged`
+                ? `Recording time: ${formatTimer(sessionTime)} • ${repCount} reps validated • ${passedAttempts} passed`
                 : 'Click Start Recording when positioned. Repetitions and kinematics will be collected.'}
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2.5 w-full sm:w-auto">
+        <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
           {!isRecording ? (
-            <button
-              type="button"
-              onClick={startRecording}
-              className="flex-1 sm:flex-none px-6 py-3 rounded-xl bg-teal-600 hover:bg-teal-500 text-white font-bold text-xs sm:text-sm shadow-md shadow-teal-600/30 transition-all flex items-center justify-center gap-2"
-            >
-              <Play className="w-4 h-4 fill-current" />
-              <span>Start Recording</span>
-            </button>
+            <>
+              {recordedVideoUrl && (
+                <button
+                  type="button"
+                  onClick={handleDownloadVideo}
+                  className="px-4 py-2.5 rounded-full glass-pill hover:bg-[#1f2233] text-[#7DE8F0] font-semibold text-xs border border-white/10 shadow-sm transition-all flex items-center justify-center gap-2"
+                  title="Save captured exercise video directly to your Downloads folder"
+                >
+                  <Download className="w-4 h-4 text-[#7DE8F0]" />
+                  <span>Download Video</span>
+                </button>
+              )}
+              {summaryReport && (
+                <button
+                  type="button"
+                  onClick={() => setShowSummaryModal(true)}
+                  className="px-4 py-2.5 rounded-full glass-pill hover:bg-[#1f2233] text-white font-semibold text-xs border border-white/10 shadow-sm transition-all flex items-center justify-center gap-2"
+                >
+                  <Activity className="w-4 h-4 text-[#A78BFA]" />
+                  <span>Review Report</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={startRecording}
+                className="btn-pill-primary text-xs !py-2.5 !px-6 flex items-center justify-center gap-2"
+              >
+                <Play className="w-4 h-4 fill-current" />
+                <span>{recordedVideoUrl ? 'Record New Session' : 'Start Recording'}</span>
+              </button>
+            </>
           ) : (
             <button
               type="button"
               onClick={endAssessment}
-              className="flex-1 sm:flex-none px-6 py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs sm:text-sm shadow-md shadow-rose-600/30 transition-all flex items-center justify-center gap-2"
+              className="px-6 py-2.5 rounded-full bg-[#FB7185] hover:bg-[#f4536d] text-white font-bold text-xs shadow-lg shadow-[#FB7185]/20 transition-all flex items-center justify-center gap-2"
             >
               <Square className="w-4 h-4 fill-current" />
               <span>End Assessment & Review Report</span>
@@ -935,126 +1067,311 @@ export const LiveAssessmentPage: React.FC = () => {
         </div>
       </div>
 
+      {/* FOURTH ROW: CONTROLS & BIOMECHANICAL STANDARDS */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Toolbar & Side Selector */}
+        <div className="glass-card p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2">
+            <span className="font-bold text-[#B7B8C8]">Monitored Leg:</span>
+            <div className="flex rounded-xl bg-[#0B0D16] p-0.5 border border-white/10">
+              {(['auto', 'right', 'left'] as const).map((sideOption) => (
+                <button
+                  key={sideOption}
+                  type="button"
+                  onClick={() => handleSelectLeg(sideOption)}
+                  className={`px-3 py-1 rounded-lg font-semibold text-xs transition-colors capitalize ${
+                    selectedLeg === sideOption
+                      ? 'bg-[#A78BFA] text-[#050509] shadow-xs'
+                      : 'text-[#85879C] hover:text-white'
+                  }`}
+                >
+                  {sideOption}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setIsMirrored((prev) => !prev)}
+              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                isMirrored
+                  ? 'bg-[#A78BFA]/20 border-[#A78BFA]/40 text-[#A78BFA]'
+                  : 'bg-[#171925] border-white/10 text-[#85879C] hover:text-white'
+              }`}
+              title="Toggle horizontal mirror orientation"
+            >
+              <FlipHorizontal className="w-3.5 h-3.5" />
+              <span>{isMirrored ? 'Mirrored (Selfie)' : 'Standard'}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Biomechanical Standards Summary */}
+        <div className="glass-card p-4 flex items-start gap-3 text-xs">
+          <HelpCircle className="w-4 h-4 text-[#A78BFA] shrink-0 mt-0.5" />
+          <div className="space-y-1 text-[#85879C]">
+            <span className="font-bold text-white block">Standard Biomechanical Criteria:</span>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
+              <span>Terminal Extension: <strong className="text-white">≥168°</strong></span>
+              <span>Seated Return: <strong className="text-white">≤115°</strong></span>
+              <span>Trunk Lean: <strong className="text-white">&lt;18° tilt</strong></span>
+              <span>Camera Distance: <strong className="text-white">5–7 ft side-view</strong></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* FINAL ASSESSMENT REPORT MODAL */}
       {showSummaryModal && summaryReport && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-3xl max-w-xl w-full p-6 sm:p-8 shadow-2xl border border-slate-200 space-y-5 my-8 animate-in fade-in zoom-in-95 duration-200">
+        <div className="fixed inset-0 z-50 bg-[#050509]/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
+          <div className="glass-modal rounded-3xl max-w-xl w-full p-6 sm:p-8 shadow-2xl border border-white/15 space-y-5 my-8">
             {/* Header */}
             <div className="flex items-start justify-between">
               <div>
-                <span className="text-[11px] font-bold uppercase tracking-wider text-teal-600 block mb-0.5">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-[#A78BFA] block mb-0.5">
                   Assessment Completed
                 </span>
-                <h3 className="text-2xl font-black text-slate-900">Rehabilitation Report</h3>
+                <h3 className="text-2xl font-black text-white">Rehabilitation Report</h3>
               </div>
               <span
                 className={`px-3 py-1 rounded-full text-xs font-bold ${
                   summaryReport.assessmentStatus === 'Meets configured criteria'
-                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                    : 'bg-amber-100 text-amber-800 border border-amber-200'
+                    ? 'bg-[#34D399]/20 text-[#34D399] border border-[#34D399]/30'
+                    : 'bg-[#FBBF24]/20 text-[#FBBF24] border border-[#FBBF24]/30'
                 }`}
               >
                 {summaryReport.assessmentStatus}
               </span>
             </div>
 
-            {/* Optional Local Video Preview (in-browser only) */}
-            {recordedVideoUrl && (
-              <div className="rounded-2xl overflow-hidden bg-slate-950 border border-slate-800">
+            {/* Recorded Video Player with Interactive Attempt Seek & Direct Download */}
+            {recordedVideoUrl ? (
+              <div className="rounded-2xl overflow-hidden bg-[#0B0D16] border border-white/10 space-y-1">
                 <video
+                  ref={previewVideoRef}
                   src={recordedVideoUrl}
                   controls
-                  className="w-full max-h-48 object-contain bg-slate-950"
+                  className="w-full max-h-56 object-contain bg-[#050509]"
                 />
-                <div className="px-3 py-1.5 bg-slate-900 text-[10px] text-slate-400 flex items-center justify-between">
-                  <span>Local Video Review</span>
-                  <span className="italic">Stored in browser memory only — not uploaded</span>
+                <div className="px-3 py-2 bg-[#171925] text-[11px] text-[#B7B8C8] flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold text-[#A78BFA]">Captured Session Video</span>
+                    <span className="text-[#85879C] hidden sm:inline">• Click attempts below to seek</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleDownloadVideo}
+                    className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-[#A78BFA] hover:bg-[#906ef7] text-[#050509] font-bold text-xs shadow-xs transition-colors"
+                    title="Download recorded exercise video to your local Downloads folder"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Download to Device</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-3 bg-[#171925] rounded-xl text-center text-xs text-[#85879C]">
+                Video recording unavailable — metrics-only assessment.
+              </div>
+            )}
+
+            {/* Attempt-Level Analysis & Pass Rate Card */}
+            <div className="bg-[#171925] p-4 rounded-2xl border border-white/10 space-y-3 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-white uppercase tracking-wider text-[11px]">
+                  Attempt-Level Exercise Analysis
+                </span>
+                <span className="font-bold text-[#A78BFA] bg-[#A78BFA]/20 px-2.5 py-0.5 rounded-full border border-[#A78BFA]/30">
+                  Pass Rate: {summaryReport.movementPassRate !== null ? `${summaryReport.movementPassRate}%` : 'N/A'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-4 gap-2 text-center">
+                <div className="bg-[#11131D] p-2 rounded-xl border border-white/5">
+                  <span className="text-[#85879C] block text-[10px]">Total Attempts</span>
+                  <span className="text-lg font-black text-white">{summaryReport.totalAttempts}</span>
+                </div>
+                <div className="bg-[#34D399]/10 p-2 rounded-xl border border-[#34D399]/20">
+                  <span className="text-[#34D399] block text-[10px]">Passed</span>
+                  <span className="text-lg font-black text-[#34D399]">{summaryReport.passedAttempts}</span>
+                </div>
+                <div className="bg-[#FB7185]/10 p-2 rounded-xl border border-[#FB7185]/20">
+                  <span className="text-[#FB7185] block text-[10px]">Failed</span>
+                  <span className="text-lg font-black text-[#FB7185]">{summaryReport.failedAttempts}</span>
+                </div>
+                <div className="bg-[#FBBF24]/10 p-2 rounded-xl border border-[#FBBF24]/20">
+                  <span className="text-[#FBBF24] block text-[10px]">Unassessable</span>
+                  <span className="text-lg font-black text-[#FBBF24]">{summaryReport.unassessableAttempts}</span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-white/10 text-[11px]">
+                <div>
+                  <span className="text-[#85879C] block">Valid Repetitions:</span>
+                  <strong className="text-[#A78BFA]">{summaryReport.repetitionCount}</strong>
+                </div>
+                <div>
+                  <span className="text-[#85879C] block">Range of Motion:</span>
+                  <strong className="text-[#A78BFA]">{summaryReport.rangeOfMotion}°</strong>
+                </div>
+                <div>
+                  <span className="text-[#85879C] block">Min Knee Flexion:</span>
+                  <strong className="text-white">{summaryReport.minKneeAngle}°</strong>
+                </div>
+                <div>
+                  <span className="text-[#85879C] block">Max Extension:</span>
+                  <strong className="text-white">{summaryReport.maxKneeAngle}°</strong>
+                </div>
+              </div>
+            </div>
+
+            {/* Interactive Attempt Breakdown List */}
+            {summaryReport.attempts && summaryReport.attempts.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-[#B7B8C8]">
+                    Attempt Breakdown & Timeline
+                  </h4>
+                  <span className="text-[10px] text-[#85879C]">Click to jump in video</span>
+                </div>
+                <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1">
+                  {summaryReport.attempts.map((att) => (
+                    <div
+                      key={att.attempt_number}
+                      onClick={() => {
+                        if (previewVideoRef.current && att.start_time !== undefined) {
+                          previewVideoRef.current.currentTime = att.start_time;
+                          previewVideoRef.current.play();
+                        }
+                      }}
+                      className="p-2.5 rounded-xl border bg-[#171925] hover:bg-[#1f2233] border-white/10 transition-colors cursor-pointer text-xs flex flex-col gap-1"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-white">Attempt #{att.attempt_number}</span>
+                          <span className="px-2 py-0.5 rounded-md bg-[#11131D] text-[10px] font-mono text-[#85879C]">
+                            {formatTimer(Math.floor(att.start_time))} - {formatTimer(Math.floor(att.end_time))}
+                          </span>
+                        </div>
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                            att.outcome === 'PASS'
+                              ? 'bg-[#34D399]/20 text-[#34D399] border border-[#34D399]/30'
+                              : att.outcome === 'FAIL'
+                              ? 'bg-[#FB7185]/20 text-[#FB7185] border border-[#FB7185]/30'
+                              : 'bg-[#FBBF24]/20 text-[#FBBF24] border border-[#FBBF24]/30'
+                          }`}
+                        >
+                          {att.outcome}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-4 text-[11px] text-[#B7B8C8]">
+                        <span>Max Extension: <strong className="text-white">{att.max_knee_angle}°</strong></span>
+                        <span>ROM: <strong className="text-white">{att.range_of_motion}°</strong></span>
+                        {att.trunk_lean_max > 0 && (
+                          <span>Trunk Lean: <strong className="text-white">{att.trunk_lean_max}°</strong></span>
+                        )}
+                      </div>
+
+                      {att.deviations && att.deviations.length > 0 && (
+                        <div className="text-[10px] text-[#FB7185] space-y-0.5 pt-0.5">
+                          {att.deviations.map((dev, dIdx) => (
+                            <div key={dIdx} className="flex items-center gap-1">
+                              <span>•</span>
+                              <span>{dev}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
 
-            {/* Metrics Grid */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 bg-slate-50 p-4 rounded-2xl border border-slate-200 text-xs">
-              <div>
-                <span className="text-slate-500 block">Exercise</span>
-                <span className="font-bold text-slate-900">Seated Knee Extension</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block">Duration</span>
-                <span className="font-bold text-slate-900">{formatTimer(sessionTime)}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block">Repetitions</span>
-                <span className="font-bold text-teal-700 text-sm">{summaryReport.repetitionCount}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block">Range of Motion</span>
-                <span className="font-bold text-teal-700 text-sm">{summaryReport.rangeOfMotion}°</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block">Min / Max Knee Angle</span>
-                <span className="font-semibold text-slate-800">
-                  {summaryReport.minKneeAngle}° / {summaryReport.maxKneeAngle}°
-                </span>
-              </div>
-              <div>
-                <span className="text-slate-500 block">Tracking Quality</span>
-                <span className="font-semibold text-slate-800">{summaryReport.trackingQuality}</span>
-              </div>
-            </div>
-
             {/* Observations List */}
             <div>
-              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700 mb-2">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-[#B7B8C8] mb-1.5">
                 Movement & Posture Observations
               </h4>
-              <ul className="space-y-1.5 text-xs text-slate-600">
+              <ul className="space-y-1.5 text-xs text-[#85879C]">
                 {summaryReport.observations.map((obs, idx) => (
-                  <li key={idx} className="flex items-start gap-2 bg-slate-50 p-2.5 rounded-xl border border-slate-100">
-                    <span className="text-teal-600 font-bold shrink-0">•</span>
+                  <li key={idx} className="flex items-start gap-2 bg-[#171925] p-2 rounded-xl border border-white/5">
+                    <span className="text-[#A78BFA] font-bold shrink-0">•</span>
                     <span>{obs}</span>
                   </li>
                 ))}
               </ul>
             </div>
 
-            {/* Metadata Footer */}
-            <div className="p-3 rounded-xl bg-teal-50/70 border border-teal-100 text-[11px] text-teal-900 space-y-0.5">
-              <span className="font-bold block">Methodology & Reference Targets:</span>
-              <span>
-                Assessment Method: MediaPipe Tasks Vision Pose Landmarker • Target Extension: ≥168° • Starting Flexion: ≤115° • Max Trunk Lean: &lt;18°
-              </span>
-            </div>
-
             {/* Modal Actions */}
-            <div className="flex items-center gap-3 pt-2">
+            <div className="flex flex-col sm:flex-row items-center gap-2.5 pt-2">
               <button
                 type="button"
                 onClick={() => setShowSummaryModal(false)}
-                className="flex-1 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs transition-colors"
+                className="w-full sm:w-auto px-4 py-2.5 rounded-full bg-[#171925] hover:bg-[#1f2233] text-[#B7B8C8] font-semibold text-xs transition-colors border border-white/10"
               >
-                Close
+                Cancel
               </button>
 
               {!savedSuccess ? (
-                <button
-                  type="button"
-                  onClick={handleSaveAssessment}
-                  disabled={isSaving}
-                  className="flex-1 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs shadow-md shadow-teal-600/20 transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
-                >
-                  <Save className="w-4 h-4" />
-                  <span>{isSaving ? 'Saving to Database...' : 'Save Assessment to Doctor Portal'}</span>
-                </button>
+                <>
+                  {recordedVideoUrl && (
+                    <button
+                      type="button"
+                      onClick={handleDownloadVideo}
+                      className="px-4 py-2.5 rounded-full bg-[#171925] hover:bg-[#1f2233] text-white font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 border border-white/10"
+                      title="Save video file directly to your local Downloads folder"
+                    >
+                      <Download className="w-4 h-4 text-[#7DE8F0]" />
+                      <span>Download Video</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => handleSaveAssessment(false)}
+                    disabled={isSaving}
+                    className="flex-1 w-full py-2.5 rounded-full bg-[#171925] hover:bg-[#1f2233] text-white font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50 border border-white/10"
+                  >
+                    <span>Save Metrics Only</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleSaveAssessment(true)}
+                    disabled={isSaving || !recordedVideoUrl}
+                    className="flex-1 w-full py-2.5 rounded-full btn-pill-primary text-xs !py-2.5 flex items-center justify-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Save className="w-4 h-4" />
+                    <span>{isSaving ? 'Uploading & Saving...' : 'Save Video and Report'}</span>
+                  </button>
+                </>
               ) : (
-                <button
-                  type="button"
-                  onClick={() => navigate('/patient/reports')}
-                  className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-md transition-all flex items-center justify-center gap-1.5"
-                >
-                  <Check className="w-4 h-4" />
-                  <span>Saved! View in My Reports</span>
-                </button>
+                <div className="flex flex-col sm:flex-row items-center gap-2 w-full">
+                  {recordedVideoUrl && (
+                    <button
+                      type="button"
+                      onClick={handleDownloadVideo}
+                      className="px-4 py-2.5 rounded-full bg-[#171925] hover:bg-[#1f2233] text-white font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 border border-white/10"
+                      title="Save another copy to your local Downloads folder"
+                    >
+                      <Download className="w-4 h-4 text-[#7DE8F0]" />
+                      <span>Download Video</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => navigate('/patient/reports')}
+                    className="flex-1 w-full py-2.5 rounded-full bg-[#34D399] hover:bg-[#2cb683] text-[#050509] font-bold text-xs shadow-md transition-all flex items-center justify-center gap-1.5"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>Report Saved! View in My Reports</span>
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -1063,3 +1380,4 @@ export const LiveAssessmentPage: React.FC = () => {
     </div>
   );
 };
+

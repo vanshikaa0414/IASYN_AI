@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { Landmark } from '@mediapipe/tasks-vision';
-import { RotateCcw, Box, ShieldCheck, AlertCircle } from 'lucide-react';
+import { RotateCcw, Box, ShieldCheck, AlertCircle, Eye } from 'lucide-react';
 
 interface Live3DPoseVisualizationProps {
   worldLandmarks: Landmark[] | null;
@@ -51,42 +51,43 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
 
   // Mesh refs for updating geometry in place
   const jointMeshesRef = useRef<Map<number, THREE.Mesh>>(new Map());
-  const lineSegmentsRef = useRef<THREE.LineSegments | null>(null);
+  const boneMeshesRef = useRef<THREE.Mesh[]>([]);
   const monitoredKneeMeshRef = useRef<THREE.Mesh | null>(null);
 
   // Camera Orbit state
   const isDraggingRef = useRef(false);
   const previousMousePositionRef = useRef({ x: 0, y: 0 });
-  const cameraAngleRef = useRef({ theta: 0.6, phi: 0.25, radius: 1.8 });
+  const cameraAngleRef = useRef({ theta: 0.55, phi: 0.15, radius: 2.1 });
 
   const monitoredKneeIndex = monitoredSide === 'right' ? 26 : 25;
 
-  // Reset Camera View to optimal default angled side profile
+  // Reset Camera View to optimal angled 3/4 profile
   const resetCamera = useCallback(() => {
-    cameraAngleRef.current = { theta: 0.7, phi: 0.2, radius: 1.7 };
+    cameraAngleRef.current = { theta: 0.55, phi: 0.15, radius: 2.1 };
     updateCameraPosition();
   }, []);
 
   const updateCameraPosition = () => {
     if (!cameraRef.current) return;
     const { theta, phi, radius } = cameraAngleRef.current;
-    const clampedPhi = Math.max(-Math.PI / 2.5, Math.min(Math.PI / 2.5, phi));
+    const clampedPhi = Math.max(-Math.PI / 2.6, Math.min(Math.PI / 2.6, phi));
     cameraRef.current.position.x = radius * Math.cos(clampedPhi) * Math.sin(theta);
     cameraRef.current.position.y = radius * Math.sin(clampedPhi);
     cameraRef.current.position.z = radius * Math.cos(clampedPhi) * Math.cos(theta);
-    cameraRef.current.lookAt(0, 0, 0);
+    cameraRef.current.lookAt(0, -0.15, 0);
   };
 
   // Initialize Three.js Scene
   useEffect(() => {
-    if (!containerRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
 
-    const width = containerRef.current.clientWidth || 320;
-    const height = containerRef.current.clientHeight || 280;
+    const width = container.clientWidth || 480;
+    const height = container.clientHeight || 360;
 
     // 1. Scene
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x060913); // Deep clinical slate
+    scene.background = new THREE.Color(0x0b0d16); // Deep dark technology background
     sceneRef.current = scene;
 
     // 2. Camera
@@ -101,67 +102,116 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     rendererRef.current = renderer;
 
-    // Append canvas
-    containerRef.current.appendChild(renderer.domElement);
+    container.appendChild(renderer.domElement);
 
-    // 4. Lights
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.9);
+    // 4. Lighting for rich 3D specular highlights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
     scene.add(ambientLight);
 
-    const dirLight = new THREE.DirectionalLight(0x5eead4, 1.2);
-    dirLight.position.set(2, 3, 2);
-    scene.add(dirLight);
+    const dirLight1 = new THREE.DirectionalLight(0xa78bfa, 1.4);
+    dirLight1.position.set(3, 4, 3);
+    scene.add(dirLight1);
 
-    // 5. Floor Reference Grid
-    const grid = new THREE.GridHelper(1.8, 12, 0x14b8a6, 0x1e293b);
-    grid.position.y = -0.75;
+    const dirLight2 = new THREE.DirectionalLight(0x7de8f0, 0.9);
+    dirLight2.position.set(-3, 2, -2);
+    scene.add(dirLight2);
+
+    // 5. Floor Reference Grid with subtle violet/dark tones
+    const grid = new THREE.GridHelper(2.4, 16, 0x7c6cf5, 0x171925);
+    grid.position.y = -0.95;
     scene.add(grid);
 
-    // 6. Joint Spheres
-    const jointGeo = new THREE.SphereGeometry(0.022, 16, 16);
+    // 6. Joint Spheres with clearly visible dimensions
+    // Standard joints: radius 0.038 (clearly visible, luminous cyan)
+    const standardJointGeo = new THREE.SphereGeometry(0.038, 20, 20);
     const standardJointMat = new THREE.MeshStandardMaterial({
-      color: 0x38bdf8, // Sky blue
-      roughness: 0.3,
-      metalness: 0.2,
+      color: 0x7de8f0,
+      emissive: 0x22d3ee,
+      emissiveIntensity: 0.45,
+      roughness: 0.25,
+      metalness: 0.3,
     });
 
-    const highlightKneeGeo = new THREE.SphereGeometry(0.045, 16, 16);
-    const highlightKneeMat = new THREE.MeshStandardMaterial({
-      color: 0x14b8a6, // Bright clinical teal
-      emissive: 0x0d9488,
-      emissiveIntensity: 0.6,
+    // Hip joints: radius 0.044 (violet)
+    const hipJointGeo = new THREE.SphereGeometry(0.044, 20, 20);
+    const hipJointMat = new THREE.MeshStandardMaterial({
+      color: 0xa78bfa,
+      emissive: 0x7c6cf5,
+      emissiveIntensity: 0.55,
       roughness: 0.2,
+      metalness: 0.3,
+    });
+
+    // Monitored Knee Joint: radius 0.062 (large beacon highlight)
+    const highlightKneeGeo = new THREE.SphereGeometry(0.062, 24, 24);
+    const highlightKneeMat = new THREE.MeshStandardMaterial({
+      color: 0x34d399, // Vibrant emerald/mint
+      emissive: 0x059669,
+      emissiveIntensity: 0.75,
+      roughness: 0.15,
+      metalness: 0.4,
     });
 
     TRACKED_JOINTS.forEach((idx) => {
       const isMonitored = idx === monitoredKneeIndex;
-      const mesh = new THREE.Mesh(
-        isMonitored ? highlightKneeGeo : jointGeo,
-        isMonitored ? highlightKneeMat : standardJointMat
-      );
+      const isHip = idx === 23 || idx === 24;
+
+      let geo = standardJointGeo;
+      let mat = standardJointMat;
+
+      if (isMonitored) {
+        geo = highlightKneeGeo;
+        mat = highlightKneeMat;
+      } else if (isHip) {
+        geo = hipJointGeo;
+        mat = hipJointMat;
+      }
+
+      const mesh = new THREE.Mesh(geo, mat);
       mesh.visible = false;
       scene.add(mesh);
       jointMeshesRef.current.set(idx, mesh);
       if (isMonitored) monitoredKneeMeshRef.current = mesh;
     });
 
-    // 7. Bone Lines Geometry
-    const linePositions = new Float32Array(SKELETON_CONNECTIONS.length * 2 * 3);
-    const lineGeo = new THREE.BufferGeometry();
-    lineGeo.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+    // 7. 3D Volumetric Cylinder Bones (Thick visible 3D limbs)
+    const boneCylinderGeo = new THREE.CylinderGeometry(0.018, 0.018, 1, 12);
+    // Rotate cylinder so its length aligns along Z axis for lookAt positioning
+    boneCylinderGeo.rotateX(Math.PI / 2);
 
-    const lineMat = new THREE.LineBasicMaterial({
-      color: 0x2dd4bf, // Teal skeleton limbs
-      linewidth: 2,
-      transparent: true,
-      opacity: 0.85,
+    const boneMat = new THREE.MeshStandardMaterial({
+      color: 0x7c6cf5, // Deep violet
+      emissive: 0x4f46e5,
+      emissiveIntensity: 0.35,
+      roughness: 0.3,
+      metalness: 0.2,
     });
 
-    const lines = new THREE.LineSegments(lineGeo, lineMat);
-    scene.add(lines);
-    lineSegmentsRef.current = lines;
+    const activeLegBoneMat = new THREE.MeshStandardMaterial({
+      color: 0x7de8f0, // Cyan for monitored leg
+      emissive: 0x0891b2,
+      emissiveIntensity: 0.5,
+      roughness: 0.2,
+      metalness: 0.3,
+    });
 
-    // Mouse Drag Rotation and Zoom Handlers
+    const boneMeshes: THREE.Mesh[] = [];
+    SKELETON_CONNECTIONS.forEach(([startIdx, endIdx]) => {
+      const isMonitoredLeg = 
+        (startIdx === 24 && endIdx === 26) || (startIdx === 26 && endIdx === 28) || // right leg
+        (startIdx === 23 && endIdx === 25) || (startIdx === 25 && endIdx === 27);    // left leg
+
+      const mesh = new THREE.Mesh(
+        boneCylinderGeo, 
+        isMonitoredLeg ? activeLegBoneMat : boneMat
+      );
+      mesh.visible = false;
+      scene.add(mesh);
+      boneMeshes.push(mesh);
+    });
+    boneMeshesRef.current = boneMeshes;
+
+    // 8. Mouse & Touch Drag Controls
     const dom = renderer.domElement;
 
     const handleMouseDown = (e: MouseEvent) => {
@@ -174,8 +224,8 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
       const deltaX = e.clientX - previousMousePositionRef.current.x;
       const deltaY = e.clientY - previousMousePositionRef.current.y;
 
-      cameraAngleRef.current.theta -= deltaX * 0.01;
-      cameraAngleRef.current.phi += deltaY * 0.01;
+      cameraAngleRef.current.theta -= deltaX * 0.008;
+      cameraAngleRef.current.phi += deltaY * 0.008;
       updateCameraPosition();
 
       previousMousePositionRef.current = { x: e.clientX, y: e.clientY };
@@ -187,7 +237,7 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
 
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
-      cameraAngleRef.current.radius = Math.max(0.6, Math.min(3.5, cameraAngleRef.current.radius + e.deltaY * 0.002));
+      cameraAngleRef.current.radius = Math.max(0.8, Math.min(3.8, cameraAngleRef.current.radius + e.deltaY * 0.002));
       updateCameraPosition();
     };
 
@@ -196,7 +246,7 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
     window.addEventListener('mouseup', handleMouseUp);
     dom.addEventListener('wheel', handleWheel, { passive: false });
 
-    // Touch support for mobile devices
+    // Touch controls
     const handleTouchStart = (e: TouchEvent) => {
       if (e.touches.length === 1) {
         isDraggingRef.current = true;
@@ -209,8 +259,8 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
       const deltaX = e.touches[0].clientX - previousMousePositionRef.current.x;
       const deltaY = e.touches[0].clientY - previousMousePositionRef.current.y;
 
-      cameraAngleRef.current.theta -= deltaX * 0.01;
-      cameraAngleRef.current.phi += deltaY * 0.01;
+      cameraAngleRef.current.theta -= deltaX * 0.008;
+      cameraAngleRef.current.phi += deltaY * 0.008;
       updateCameraPosition();
 
       previousMousePositionRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
@@ -224,9 +274,9 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
     dom.addEventListener('touchmove', handleTouchMove);
     dom.addEventListener('touchend', handleTouchEnd);
 
-    // Resize Observer
+    // 9. Resize Observer
     const resizeObserver = new ResizeObserver((entries) => {
-      for (let entry of entries) {
+      for (const entry of entries) {
         const { width: newW, height: newH } = entry.contentRect;
         if (newW > 0 && newH > 0 && rendererRef.current && cameraRef.current) {
           cameraRef.current.aspect = newW / newH;
@@ -235,9 +285,9 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
         }
       }
     });
-    resizeObserver.observe(containerRef.current);
+    resizeObserver.observe(container);
 
-    // Render loop
+    // 10. Animation Loop
     const animate = () => {
       if (rendererRef.current && sceneRef.current && cameraRef.current) {
         rendererRef.current.render(sceneRef.current, cameraRef.current);
@@ -246,7 +296,7 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
     };
     animationFrameRef.current = requestAnimationFrame(animate);
 
-    // Cleanup on unmount
+    // Cleanup
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       resizeObserver.disconnect();
@@ -259,155 +309,146 @@ export const Live3DPoseVisualization: React.FC<Live3DPoseVisualizationProps> = (
       dom.removeEventListener('touchmove', handleTouchMove);
       dom.removeEventListener('touchend', handleTouchEnd);
 
-      // Dispose Three.js objects
-      jointGeo.dispose();
+      standardJointGeo.dispose();
+      hipJointGeo.dispose();
       highlightKneeGeo.dispose();
       standardJointMat.dispose();
+      hipJointMat.dispose();
       highlightKneeMat.dispose();
-      lineGeo.dispose();
-      lineMat.dispose();
-      renderer.dispose();
+      boneCylinderGeo.dispose();
+      boneMat.dispose();
+      activeLegBoneMat.dispose();
+      grid.geometry.dispose();
 
+      renderer.dispose();
       if (dom.parentNode) {
         dom.parentNode.removeChild(dom);
       }
     };
-  }, []);
+  }, [monitoredKneeIndex]);
 
-  // Update Joint and Line Positions when new worldLandmarks arrive
+  // Update Joint and Volumetric Bone Positions when new worldLandmarks arrive
   useEffect(() => {
-    if (!lineSegmentsRef.current) return;
-
     if (!worldLandmarks || worldLandmarks.length < 29 || !isTracking) {
       // Hide all meshes if tracking is lost or insufficient
       jointMeshesRef.current.forEach((mesh) => {
         mesh.visible = false;
       });
-      lineSegmentsRef.current.visible = false;
+      boneMeshesRef.current.forEach((mesh) => {
+        mesh.visible = false;
+      });
       return;
     }
 
     // MediaPipe world landmarks are metric with origin near hips.
-    // Let's compute pelvic center for relative stability
+    // Stable origin at pelvic midpoint
     const leftHip = worldLandmarks[23];
     const rightHip = worldLandmarks[24];
     const originX = (leftHip.x + rightHip.x) / 2;
     const originY = (leftHip.y + rightHip.y) / 2;
     const originZ = (leftHip.z + rightHip.z) / 2;
 
-    // Helper: convert MediaPipe world coordinate to Three.js coordinate
-    // MediaPipe: +X is right, +Y is down (invert to up in Three.js), +Z is towards camera (invert)
-    const getPoint = (lm: Landmark) => {
-      return {
-        x: lm.x - originX,
-        y: -(lm.y - originY),
-        z: -(lm.z - originZ),
-      };
+    const getVector3 = (lm: Landmark) => {
+      return new THREE.Vector3(
+        lm.x - originX,
+        -(lm.y - originY), // Invert Y from MediaPipe down to Three.js up
+        -(lm.z - originZ)  // Invert Z from camera-forward
+      );
     };
 
-    // Update Joints
+    // 1. Update Joint Spheres
+    const pointCache = new Map<number, THREE.Vector3>();
+
     TRACKED_JOINTS.forEach((idx) => {
       const mesh = jointMeshesRef.current.get(idx);
       const lm = worldLandmarks[idx];
       if (mesh && lm) {
-        const pt = getPoint(lm);
-        mesh.position.set(pt.x, pt.y, pt.z);
+        const pt = getVector3(lm);
+        pointCache.set(idx, pt);
+        mesh.position.copy(pt);
         mesh.visible = true;
       }
     });
 
-    // Update Bone Lines
-    const lineGeo = lineSegmentsRef.current.geometry as THREE.BufferGeometry;
-    const posAttr = lineGeo.attributes.position as THREE.BufferAttribute;
-    const posArray = posAttr.array as Float32Array;
+    // 2. Update Thick 3D Bones
+    SKELETON_CONNECTIONS.forEach(([startIdx, endIdx], boneIdx) => {
+      const boneMesh = boneMeshesRef.current[boneIdx];
+      const p1 = pointCache.get(startIdx);
+      const p2 = pointCache.get(endIdx);
 
-    let pIdx = 0;
-    SKELETON_CONNECTIONS.forEach(([startIdx, endIdx]) => {
-      const startLm = worldLandmarks[startIdx];
-      const endLm = worldLandmarks[endIdx];
+      if (boneMesh && p1 && p2) {
+        // Distance and midpoint
+        const dist = p1.distanceTo(p2);
+        if (dist > 0.01) {
+          const midpoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+          boneMesh.position.copy(midpoint);
 
-      if (startLm && endLm) {
-        const p1 = getPoint(startLm);
-        const p2 = getPoint(endLm);
+          // Scale length along Z axis
+          boneMesh.scale.set(1, 1, dist);
 
-        posArray[pIdx++] = p1.x;
-        posArray[pIdx++] = p1.y;
-        posArray[pIdx++] = p1.z;
-
-        posArray[pIdx++] = p2.x;
-        posArray[pIdx++] = p2.y;
-        posArray[pIdx++] = p2.z;
-      } else {
-        pIdx += 6;
+          // Orient towards p2
+          boneMesh.lookAt(p2);
+          boneMesh.visible = true;
+        } else {
+          boneMesh.visible = false;
+        }
+      } else if (boneMesh) {
+        boneMesh.visible = false;
       }
     });
-
-    posAttr.needsUpdate = true;
-    lineSegmentsRef.current.visible = true;
-  }, [worldLandmarks, isTracking, monitoredKneeIndex]);
-
-  const hasValidPose = isTracking && worldLandmarks && worldLandmarks.length >= 29;
+  }, [worldLandmarks, isTracking]);
 
   return (
-    <div className="flex flex-col h-full bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden shadow-lg">
-      {/* 3D Header Bar */}
-      <div className="bg-slate-950 px-4 py-2.5 border-b border-slate-800 flex items-center justify-between text-xs">
-        <div className="flex items-center gap-2">
-          <Box className="w-4 h-4 text-teal-400" />
-          <span className="font-bold text-slate-200">Live 3D Pose Visualization</span>
-          {hasValidPose ? (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-teal-950 border border-teal-800 text-[10px] font-semibold text-teal-300">
-              <span className="w-1.5 h-1.5 rounded-full bg-teal-400 animate-pulse" />
-              Tracking Active
-            </span>
-          ) : (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-950/70 border border-amber-800/80 text-[10px] font-semibold text-amber-300">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-              Insufficient Tracking
-            </span>
-          )}
-        </div>
+    <div className="relative w-full h-full min-h-[320px] rounded-2xl overflow-hidden bg-[#0B0D16] border border-white/10 shadow-xl flex items-center justify-center">
+      {/* Three.js Canvas Container */}
+      <div ref={containerRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
 
+      {/* Top Header Badge */}
+      <div className="absolute top-3 left-3 z-10 flex items-center gap-2 pointer-events-none">
+        <div className="bg-[#11131D]/90 backdrop-blur-md px-3 py-1.5 rounded-xl border border-white/10 text-xs text-white flex items-center gap-2 shadow-md">
+          <span className={`w-2 h-2 rounded-full ${isTracking ? 'bg-[#7DE8F0] animate-pulse' : 'bg-amber-400'}`} />
+          <span className="font-bold text-[11px] tracking-wider uppercase font-mono">
+            3D Biomechanical Skeleton
+          </span>
+        </div>
+      </div>
+
+      {/* Top Right Controls */}
+      <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
         <button
           type="button"
           onClick={resetCamera}
-          className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-medium transition-colors flex items-center gap-1 shadow-xs"
-          title="Reset 3D Camera Orbit"
+          className="p-2 rounded-xl bg-[#11131D]/85 hover:bg-[#171925] border border-white/10 text-[#B7B8C8] hover:text-white transition-colors shadow-md"
+          title="Reset 3D Camera Angle"
         >
-          <RotateCcw className="w-3 h-3" />
-          <span>Reset View</span>
+          <RotateCcw className="w-3.5 h-3.5" />
         </button>
       </div>
 
-      {/* 3D Canvas Container */}
-      <div className="relative flex-1 min-h-[260px] w-full" ref={containerRef}>
-        {!hasValidPose && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/90 backdrop-blur-xs z-10 pointer-events-none">
-            <AlertCircle className="w-8 h-8 text-amber-400 mb-2 opacity-80" />
-            <p className="text-slate-200 font-semibold text-sm mb-1">
-              3D pose unavailable — insufficient tracking.
-            </p>
-            <p className="text-slate-400 text-xs max-w-xs">
-              Position webcam to capture your side profile (hip, knee, and ankle visible).
-            </p>
-          </div>
-        )}
+      {/* Bottom Status Tag */}
+      <div className="absolute bottom-3 left-3 right-3 z-10 flex items-center justify-between pointer-events-none text-[11px] font-mono">
+        <div className="bg-[#11131D]/90 backdrop-blur-md px-3 py-1.5 rounded-xl border border-white/10 text-[#B7B8C8] flex items-center gap-2">
+          <span>MONITORED:</span>
+          <span className="text-[#34D399] font-bold uppercase">{monitoredSide} KNEE</span>
+        </div>
 
-        {/* Orbit Helper Tip */}
-        {hasValidPose && (
-          <div className="absolute top-2 left-2 z-10 pointer-events-none">
-            <span className="text-[10px] bg-slate-900/80 backdrop-blur-xs text-slate-400 px-2 py-0.5 rounded-md border border-slate-800">
-              Drag to rotate • Scroll to zoom
-            </span>
-          </div>
-        )}
+        <div className="bg-[#11131D]/90 backdrop-blur-md px-3 py-1.5 rounded-xl border border-white/10 text-[#85879C]">
+          <span>DRAG TO ORBIT • SCROLL TO ZOOM</span>
+        </div>
       </div>
 
-      {/* 3D Footer Clinical Disclaimer */}
-      <div className="bg-slate-950 px-3.5 py-2 border-t border-slate-800 flex items-center justify-between text-[11px] text-slate-500">
-        <span>Active Joint: <strong className="text-teal-400 capitalize">{monitoredSide} Knee</strong></span>
-        <span>Estimated monocular metric pose</span>
-      </div>
+      {/* Tracking Lost / Inactive Placeholder Overlay */}
+      {(!isTracking || !worldLandmarks || worldLandmarks.length < 29) && (
+        <div className="absolute inset-0 z-20 bg-[#0B0D16]/85 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center">
+          <div className="w-12 h-12 rounded-2xl bg-[#11131D] border border-white/10 flex items-center justify-center text-[#A78BFA] mb-3 shadow-inner">
+            <Box className="w-6 h-6 animate-pulse" />
+          </div>
+          <h4 className="text-sm font-bold text-white mb-1">Awaiting World Landmarks</h4>
+          <p className="text-xs text-[#85879C] max-w-xs leading-relaxed">
+            Position your entire lower limb inside the webcam view to project real-time 3D skeleton kinematics.
+          </p>
+        </div>
+      )}
     </div>
   );
 };

@@ -11,5 +11,6 @@ export interface Exercise {
   youtubeId?: string;
   youtubeUrl?: string;
   thumbnailPlaceholderColor: string;
+  imageUrl?: string;
   recommendedReps: string;
 }

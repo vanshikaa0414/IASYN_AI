@@ -23,6 +23,7 @@ export const EXERCISES: Exercise[] = [
     youtubeId: 'h8UPMnv_BOA',
     youtubeUrl: 'https://www.youtube.com/watch?v=h8UPMnv_BOA',
     thumbnailPlaceholderColor: 'from-teal-500 to-emerald-600',
+    imageUrl: '/images/exercises/seated-knee-extension.jpg',
     recommendedReps: '3 sets of 10 repetitions'
   },
   {
@@ -47,6 +48,7 @@ export const EXERCISES: Exercise[] = [
     youtubeId: '5TUK4uT2nnw',
     youtubeUrl: 'https://www.youtube.com/watch?v=5TUK4uT2nnw',
     thumbnailPlaceholderColor: 'from-sky-500 to-blue-600',
+    imageUrl: '/images/exercises/quadriceps-sets.jpg',
     recommendedReps: '3 sets of 10 holds (5s each)'
   },
   {
@@ -71,6 +73,7 @@ export const EXERCISES: Exercise[] = [
     youtubeId: 'U4L_6JEv9Jg',
     youtubeUrl: 'https://www.youtube.com/watch?v=U4L_6JEv9Jg',
     thumbnailPlaceholderColor: 'from-cyan-500 to-teal-600',
+    imageUrl: '/images/exercises/straight-leg-raise.jpg',
     recommendedReps: '2-3 sets of 8-10 repetitions'
   },
   {
@@ -95,6 +98,7 @@ export const EXERCISES: Exercise[] = [
     youtubeId: '6-anByqnKp8',
     youtubeUrl: 'https://www.youtube.com/watch?v=6-anByqnKp8',
     thumbnailPlaceholderColor: 'from-emerald-500 to-teal-700',
+    imageUrl: '/images/exercises/heel-slides.jpg',
     recommendedReps: '3 sets of 10 repetitions'
   },
   {
@@ -119,6 +123,7 @@ export const EXERCISES: Exercise[] = [
     youtubeId: '7dQTbp2j-E4',
     youtubeUrl: 'https://www.youtube.com/watch?v=7dQTbp2j-E4',
     thumbnailPlaceholderColor: 'from-blue-600 to-indigo-700',
+    imageUrl: '/images/exercises/standing-hamstring-curl.jpg',
     recommendedReps: '3 sets of 10-12 repetitions'
   },
   {
@@ -143,6 +148,7 @@ export const EXERCISES: Exercise[] = [
     youtubeId: 'dV4Yjv-gsyY',
     youtubeUrl: 'https://www.youtube.com/watch?v=dV4Yjv-gsyY',
     thumbnailPlaceholderColor: 'from-teal-600 to-cyan-700',
+    imageUrl: '/images/exercises/heel-raises.jpg',
     recommendedReps: '3 sets of 12-15 repetitions'
   }
 ];
