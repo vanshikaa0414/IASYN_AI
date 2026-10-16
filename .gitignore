@@ -50,5 +50,7 @@ Thumbs.db
 
 # Large Archives & Datasets
 dataset_input/dataset.zip
+dataset_input/dataset/
 *.zip
 *.tar.gz
+
