@@ -1,0 +1,55 @@
+{
+  "model_name": "KneeExtension1DCNN",
+  "model_version": "1D-CNN-v1.0",
+  "test_subjects": [
+    6,
+    12,
+    18,
+    24,
+    30
+  ],
+  "num_test_trials": 130,
+  "metrics": {
+    "test_accuracy": 0.8384615384615385,
+    "macro_precision": 0.858302666848394,
+    "macro_recall": 0.8351964769647697,
+    "macro_f1": 0.8329407294832826,
+    "per_class": {
+      "Correct Seated Knee Extension": {
+        "precision": 0.7090909090909091,
+        "recall": 0.9512195121951219,
+        "f1": 0.8125,
+        "support": 41
+      },
+      "Wrong: Incomplete Range of Motion": {
+        "precision": 0.9310344827586207,
+        "recall": 0.6585365853658537,
+        "f1": 0.7714285714285715,
+        "support": 41
+      },
+      "Wrong: Lifting Limb from Chair": {
+        "precision": 0.9347826086956522,
+        "recall": 0.8958333333333334,
+        "f1": 0.9148936170212766,
+        "support": 48
+      }
+    },
+    "confusion_matrix": [
+      [
+        39,
+        0,
+        2
+      ],
+      [
+        13,
+        27,
+        1
+      ],
+      [
+        3,
+        2,
+        43
+      ]
+    ]
+  }
+}

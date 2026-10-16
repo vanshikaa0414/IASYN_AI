@@ -1,0 +1,55 @@
+{
+  "model_type": "RandomForestClassifier",
+  "n_estimators": 100,
+  "features_per_sample": 392,
+  "test_subjects": [
+    6,
+    12,
+    18,
+    24,
+    30
+  ],
+  "metrics": {
+    "test_accuracy": 0.7307692307692307,
+    "macro_precision": 0.8594377510040161,
+    "macro_recall": 0.7154471544715447,
+    "macro_f1": 0.7275599264859242,
+    "per_class": {
+      "Correct Seated Knee Extension": {
+        "precision": 1.0,
+        "recall": 0.4878048780487805,
+        "f1": 0.6557377049180327,
+        "support": 41
+      },
+      "Wrong: Incomplete Range of Motion": {
+        "precision": 1.0,
+        "recall": 0.6585365853658537,
+        "f1": 0.7941176470588235,
+        "support": 41
+      },
+      "Wrong: Lifting Limb from Chair": {
+        "precision": 0.5783132530120482,
+        "recall": 1.0,
+        "f1": 0.732824427480916,
+        "support": 48
+      }
+    },
+    "confusion_matrix": [
+      [
+        20,
+        0,
+        21
+      ],
+      [
+        0,
+        27,
+        14
+      ],
+      [
+        0,
+        0,
+        48
+      ]
+    ]
+  }
+}
