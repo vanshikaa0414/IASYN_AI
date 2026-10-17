@@ -598,10 +598,14 @@ export const VideoComparisonPage: React.FC = () => {
                 <button
                   type="button"
                   onClick={analyzeReferenceVideo}
-                  disabled={isAnalyzingRef}
+                  disabled={isAnalyzingRef || isAnalyzingTest}
                   className="btn-pill-primary text-xs !py-2 !px-4 disabled:opacity-50"
                 >
-                  {isAnalyzingRef ? 'Analyzing Reference...' : 'Analyze Reference Video'}
+                  {isAnalyzingRef
+                    ? 'Analyzing Reference...'
+                    : isAnalyzingTest
+                    ? 'Waiting for Test Video...'
+                    : 'Analyze Reference Video'}
                 </button>
 
                 {refAnalysis && (
@@ -701,10 +705,14 @@ export const VideoComparisonPage: React.FC = () => {
                 <button
                   type="button"
                   onClick={analyzeTestVideo}
-                  disabled={isAnalyzingTest}
+                  disabled={isAnalyzingRef || isAnalyzingTest}
                   className="btn-pill-primary text-xs !py-2 !px-4 disabled:opacity-50"
                 >
-                  {isAnalyzingTest ? 'Analyzing Test Video...' : 'Analyze Test Video'}
+                  {isAnalyzingTest
+                    ? 'Analyzing Test Video...'
+                    : isAnalyzingRef
+                    ? 'Waiting for Reference...'
+                    : 'Analyze Test Video'}
                 </button>
 
                 {testAnalysis && (

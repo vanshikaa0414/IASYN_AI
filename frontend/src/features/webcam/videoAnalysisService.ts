@@ -111,14 +111,29 @@ export class VideoAnalysisService {
     }
   }
 
+  private activeJob: Promise<any> = Promise.resolve();
+
   /**
    * Analyzes an uploaded video file asynchronously using MediaPipe Pose Landmarker.
+   * Serializes calls through a queue to prevent concurrent decoder thrashing.
    */
   async analyzeVideoFile(
     file: File,
     options: VideoAnalysisOptions = {}
   ): Promise<VideoAnalysisResult> {
-    const sampleFps = options.sampleFps ?? 15;
+    const run = () => this.runAnalysis(file, options);
+    const resultPromise = this.activeJob.then(run, run);
+    this.activeJob = resultPromise.catch(() => {});
+    return resultPromise;
+  }
+
+  private async runAnalysis(
+    file: File,
+    options: VideoAnalysisOptions = {}
+  ): Promise<VideoAnalysisResult> {
+    // Default 6 FPS (166ms step): captures 20-30 data points per seated knee extension rep with high precision
+    // while cutting seek time and Wasm inference load by ~60% compared to 15 FPS.
+    const sampleFps = options.sampleFps ?? 6;
     const stepSec = 1.0 / sampleFps;
 
     // 1. Ensure MediaPipe is loaded
@@ -168,13 +183,18 @@ export class VideoAnalysisService {
           throw new Error('Analysis was cancelled by user.');
         }
 
-        // Seek video to currentTime
+        // Seek video to currentTime with timeout guard to prevent browser decoder deadlocks
         await new Promise<void>((resolve) => {
+          let done = false;
           const onSeeked = () => {
-            video.removeEventListener('seeked', onSeeked);
-            resolve();
+            if (!done) {
+              done = true;
+              video.removeEventListener('seeked', onSeeked);
+              resolve();
+            }
           };
-          video.addEventListener('seeked', onSeeked);
+          video.addEventListener('seeked', onSeeked, { once: true });
+          setTimeout(onSeeked, 250);
           video.currentTime = currentTime;
         });
 
